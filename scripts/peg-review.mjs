@@ -260,6 +260,39 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// -- Resilient JSON parsing ------------------------------------------------
+// The LLM occasionally returns JSON that is truncated (max_tokens hit) or
+// wrapped in markdown despite json mode. A hard failure here throws away the
+// whole month's review even when most tickers parsed fine. So: try a strict
+// parse first, then fall back to salvaging every complete `"SYMBOL": { … }`
+// entry via regex. applyRecommendations already skips any missing ticker, so
+// a partial object still produces a useful (if smaller) review.
+function parseRecommendations(raw) {
+  // Strip any markdown fences in case the model added them despite json mode.
+  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+
+  try {
+    return { recommendations: JSON.parse(cleaned), partial: false };
+  } catch (strictErr) {
+    // Salvage complete top-level entries. Each value object is flat (no nested
+    // braces), so a non-greedy `{…}` match is safe. Symbols may contain a dot
+    // (e.g. BHP.AX). A truncated trailing entry simply won't match and is
+    // dropped, which is exactly what we want.
+    const entryRe = /"([A-Za-z0-9.]+)"\s*:\s*(\{[^{}]*\})/g;
+    const salvaged = {};
+    let count = 0;
+    for (const m of cleaned.matchAll(entryRe)) {
+      try {
+        salvaged[m[1]] = JSON.parse(m[2]);
+        count++;
+      } catch { /* skip an entry that itself is malformed */ }
+    }
+    if (count === 0) throw strictErr;  // nothing recoverable — real failure
+    console.warn(`JSON parse failed (${strictErr.message}); salvaged ${count} complete ticker entr${count === 1 ? 'y' : 'ies'}.`);
+    return { recommendations: salvaged, partial: true };
+  }
+}
+
 // -- Main ------------------------------------------------------------------
 
 async function main() {
@@ -294,7 +327,10 @@ async function main() {
   let raw;
   try {
     raw = await callLLMReliable(prompt, {
-      maxTokens: 3000,
+      // ~19 tickers × a Traditional-Chinese `reason` (≤80 chars, ~2 tokens/char)
+      // plus JSON scaffolding needs well over 3k tokens; the old 3000 cap
+      // truncated the response mid-string. Give ample headroom.
+      maxTokens: 8000,
       minContentLength: 50,
       responseFormat: 'json',
     });
@@ -304,11 +340,9 @@ async function main() {
     process.exit(1);
   }
 
-  // Strip any markdown fences in case the model added them despite json mode.
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
   let recommendations;
   try {
-    recommendations = JSON.parse(cleaned);
+    ({ recommendations } = parseRecommendations(raw));
   } catch (err) {
     console.error('Failed to parse LLM JSON:', err.message);
     console.error('Raw response (first 1000 chars):', raw.slice(0, 1000));
