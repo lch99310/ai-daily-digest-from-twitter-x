@@ -155,9 +155,9 @@
       "zhName": "Microsoft",
       "searchKeywords": "Microsoft OR MSFT OR Azure OR Copilot OR OpenAI OR Maia",
       "description": "Azure + OpenAI + Copilot 的 AI 商業化領先者；同時在 device management／OTA／enterprise identity 層具 recurring revenue，但 capex 與 FCF 回收期仍是估值約束。",
-      "pegOverride": 1.75,
-      "pegRationale": "v9：AI 商業化和可信資料/企業管理層優勢明確，扣除 capex 回收期後維持高段。",
-      "pegLastChange": "2026-07-19",
+      "pegOverride": 1.85,
+      "pegRationale": "Azure 年收突破 $100B、EPS 成長 31% 驗證商業化速度；Beta 下降、獲利動能強化，PEG 上修 +0.1 至框架高段。",
+      "pegLastChange": "2026-08-03",
       "pegHistory": [
         {
           "date": "2026-06-02",
@@ -168,6 +168,11 @@
           "date": "2026-07-19",
           "peg": 1.75,
           "reason": "v9：AI 商業化和可信資料/企業管理層優勢明確，扣除 capex 回收期後維持高段。"
+        },
+        {
+          "date": "2026-08-03",
+          "peg": 1.85,
+          "reason": "Azure 年收突破 $100B、EPS 成長 31% 驗證商業化速度；Beta 下降、獲利動能強化，PEG 上修 +0.1 至框架高段。"
         }
       ],
       "cache": {
@@ -178,13 +183,13 @@
         "asOf": "2026-07-19"
       },
       "analysisAssumptions": {
-        "asOf": "2026-07-19",
-        "source": "AI supply-chain report v9",
+        "asOf": "2026-08-03",
+        "source": "monthly PEG review",
         "eps": 16.77,
         "fcfPerShare": 4.98,
         "growth5y": 0.15,
         "beta": 0.95,
-        "pegMultiplier": 1.75
+        "pegMultiplier": 1.85
       }
     },
     {
@@ -560,9 +565,9 @@
       "zhName": "Vertiv Holdings",
       "searchKeywords": "Vertiv OR VRT OR \"liquid cooling\" OR \"data center cooling\" OR UPS OR Liebert",
       "description": "Tier A：資料中心配電、UPS、rack power 與液冷；v9 稱其為 Wave 1 最長能見度之一，但銅、磁材、site 延期與價格成本倒掛仍是主要否證訊號。",
-      "pegOverride": 1.85,
-      "pegRationale": "v9：配電/冷卻是最可驗證瓶頸之一，但非完全免疫中國材料與 site 延期。",
-      "pegLastChange": "2026-07-19",
+      "pegOverride": 1.75,
+      "pegRationale": "Q2 營收未達預期（timing shift），股價 4 週跌 24%；但 $12.45B backlog 與 Oppenheimer 看多維持結構性需求敘事，PEG 下修 0.1 反映短期失望。",
+      "pegLastChange": "2026-08-03",
       "pegHistory": [
         {
           "date": "2026-05-30",
@@ -588,6 +593,11 @@
           "date": "2026-07-19",
           "peg": 1.85,
           "reason": "v9：配電/冷卻是最可驗證瓶頸之一，但非完全免疫中國材料與 site 延期。"
+        },
+        {
+          "date": "2026-08-03",
+          "peg": 1.75,
+          "reason": "Q2 營收未達預期（timing shift），股價 4 週跌 24%；但 $12.45B backlog 與 Oppenheimer 看多維持結構性需求敘事，PEG 下修 0.1 反映短期失望。"
         }
       ],
       "cache": {
@@ -598,13 +608,13 @@
         "asOf": "2026-Q1"
       },
       "analysisAssumptions": {
-        "asOf": "2026-07-19",
-        "source": "AI supply-chain report v9",
+        "asOf": "2026-08-03",
+        "source": "monthly PEG review",
         "eps": 3.1,
         "fcfPerShare": 2.4,
         "growth5y": 0.25,
         "beta": 1.45,
-        "pegMultiplier": 1.85
+        "pegMultiplier": 1.75
       }
     },
     {
@@ -770,9 +780,9 @@
       "zhName": "Macquarie Technology",
       "searchKeywords": "\"Macquarie Technology\" OR MAQ.AX OR \"Macquarie Telecom\" OR IC2",
       "description": "澳洲資料中心 + 電信 + 資安綜合科技集團；v9 的澳洲 thesis 支持資料主權與可供電土地，但 MAQ 規模小、AI 純度低於 NEXTDC。",
-      "pegOverride": 1.35,
-      "pegRationale": "v9：澳洲 AI infra exposure 明確但公司規模小且 diversified，PEG 低於 NEXTDC。",
-      "pegLastChange": "2026-07-19",
+      "pegOverride": 1.45,
+      "pegRationale": "悉尼 $3B 數據中心擴建是重大推進，融資到位且 land secured，PEG 上修 +0.1 至框架高段。",
+      "pegLastChange": "2026-08-03",
       "pegHistory": [
         {
           "date": "2026-06-02",
@@ -783,6 +793,11 @@
           "date": "2026-07-19",
           "peg": 1.35,
           "reason": "v9：澳洲 AI infra exposure 明確但公司規模小且 diversified，PEG 低於 NEXTDC。"
+        },
+        {
+          "date": "2026-08-03",
+          "peg": 1.45,
+          "reason": "悉尼 $3B 數據中心擴建是重大推進，融資到位且 land secured，PEG 上修 +0.1 至框架高段。"
         }
       ],
       "cache": {
@@ -793,13 +808,13 @@
         "asOf": "2026-07-19"
       },
       "analysisAssumptions": {
-        "asOf": "2026-07-19",
-        "source": "AI supply-chain report v9",
+        "asOf": "2026-08-03",
+        "source": "monthly PEG review",
         "eps": 0.96,
         "fcfPerShare": 0.4,
         "growth5y": 0.15,
         "beta": 0.95,
-        "pegMultiplier": 1.35
+        "pegMultiplier": 1.45
       }
     }
   ]
