@@ -1,5 +1,5 @@
 {
-  "_doc": "Weekly macro digest config. One card + one chart per indicator. NAPM (ISM PMI) and WILL5000IND were retired from FRED due to licensing disputes — replaced with INDPRO (Industrial Production) and ^GSPC (S&P 500). Buffett Indicator now uses FRED NCBEILQ027S (market value of corporate equities, $B) ÷ GDP. Capex from SEC EDGAR; private companies use manual estimates that can be edited here.",
+  "_doc": "Weekly macro digest config. One card + one chart per indicator. NAPM (ISM PMI) and WILL5000IND were retired from FRED due to licensing disputes — replaced with INDPRO (Industrial Production) and ^GSPC (S&P 500). Buffett Indicator uses FRED NCBEILQ027S (market value of nonfinancial corporate equities) / GDP; NCBEILQ027S is published in MILLIONS of dollars while GDP is in BILLIONS, so numeratorScale rebases it. Capex comes from SEC EDGAR XBRL for every company with a `cik`; `estimatedCapex` is only a fallback used when EDGAR has no usable XBRL yet, so a company switches from estimate to filed data automatically the quarter its first 10-Q lands — adding a CIK is the only edit needed.",
   "fred": [
     {
       "seriesId": "CPIAUCSL",
@@ -127,37 +127,64 @@
       "id": "buffett",
       "shortName": "Buffett Indicator",
       "zhName": "巴菲特指標",
-      "description": "FRED NCBEILQ027S (非金融企業股本市值, $B) ÷ GDP ($B)；歷史均值約 0.8-1.0，>1.5 視為偏高估值。",
+      "description": "FRED NCBEILQ027S (非金融企業股本市值) ÷ GDP；歷史均值約 0.8-1.0，>1.5 視為偏高估值。分子原始單位為百萬美元，已換算為十億美元與 GDP 對齊。",
       "numeratorSeriesId": "NCBEILQ027S",
       "denominatorSeriesId": "GDP",
       "unit": "x",
       "precision": 2,
       "chart": true,
-      "color": "rgb(153,102,255)"
+      "color": "rgb(153,102,255)",
+      "numeratorScale": 0.001,
+      "numeratorUnits": "millions",
+      "denominatorUnits": "billions"
     }
   ],
   "capex": [
-    { "company": "Microsoft", "cik": "0000789019", "isPrivate": false },
-    { "company": "Alphabet",  "cik": "0001652044", "isPrivate": false },
-    { "company": "Meta",      "cik": "0001326801", "isPrivate": false },
-    { "company": "Amazon",    "cik": "0001018724", "isPrivate": false, "note": "全公司 capex；AWS 拆分需讀 segment 註腳" },
     {
-      "company": "SpaceXAI",
+      "company": "Microsoft",
+      "cik": "0000789019",
+      "note": "6 月結算會計年度；Q4 (4-6月) 由 10-K 全年減前三季推導"
+    },
+    {
+      "company": "Alphabet",
+      "cik": "0001652044"
+    },
+    {
+      "company": "Meta",
+      "cik": "0001326801"
+    },
+    {
+      "company": "Amazon",
+      "cik": "0001018724",
+      "note": "全公司 capex；AWS 拆分需讀 segment 註腳"
+    },
+    {
+      "company": "Oracle",
+      "cik": "0001341439",
+      "note": "5 月結算會計年度；OCI / Stargate 建置為主要 capex 來源"
+    },
+    {
+      "company": "SpaceX",
       "cik": "0001181412",
-      "isPrivate": true,
-      "estimatedCapex": { "valueUSD": 4200000000, "period": "Y25E", "source": "S-1 招股書 (XBRL 尚未處理完成)" }
+      "note": "2026-06 IPO (SPCX)，2026-08-04 首份 10-Q；capex 含 Starlink 衛星與 AI 資料中心"
     },
     {
       "company": "OpenAI",
       "cik": null,
-      "isPrivate": true,
-      "estimatedCapex": { "valueUSD": 8000000000, "period": "Y25E", "source": "FT / The Information 報導估算" }
+      "estimatedCapex": {
+        "valueUSD": 50000000000,
+        "period": "Y26E",
+        "source": "總裁 Brockman 2026-05 證詞：2026 年算力支出約 $50B。多為雲端租賃與承諾，非資產負債表 capex，與上表非同一口徑"
+      }
     },
     {
       "company": "Anthropic",
       "cik": null,
-      "isPrivate": true,
-      "estimatedCapex": { "valueUSD": 3500000000, "period": "Y25E", "source": "The Information 報導估算" }
+      "estimatedCapex": {
+        "valueUSD": 50000000000,
+        "period": "多年期",
+        "source": "2025-11 宣布與 Fluidstack 合作在美投入 $50B 建置 (德州/紐約，2026 起陸續上線)；為多年期承諾非單季。2026-06-01 已機密遞件 S-1，掛牌後填入 CIK 即自動改抓 XBRL"
+      }
     }
   ]
 }

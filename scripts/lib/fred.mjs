@@ -162,16 +162,25 @@ export async function fetchNextReleaseDate(seriesId, apiKey) {
     if (!releaseId) return null;
 
     // Step 2: list future release dates (include "no data yet" entries).
+    // realtime_end must be pinned to the far future: FRED defaults it to today
+    // on most endpoints, which would return only dates that have already
+    // happened. We then drop anything <= today, because a release scheduled
+    // for this morning is not a "next release".
     const today = new Date().toISOString().slice(0, 10);
     const datesUrl =
       `https://api.stlouisfed.org/fred/release/dates` +
       `?release_id=${releaseId}` +
       `&realtime_start=${today}` +
+      `&realtime_end=9999-12-31` +
       `&include_release_dates_with_no_data=true` +
-      `&sort_order=asc&limit=3` +
+      `&sort_order=asc&limit=10` +
       `&api_key=${encodeURIComponent(apiKey)}&file_type=json`;
     const datesData = await fredGet(datesUrl, `${seriesId}/dates`);
-    return datesData.release_dates?.[0]?.date || null;
+    const upcoming = (datesData.release_dates || [])
+      .map(d => d.date)
+      .filter(d => d && d > today)
+      .sort();
+    return upcoming[0] || null;
   } catch (err) {
     console.warn(`  next-release lookup for ${seriesId} failed: ${err.message}`);
     return null;

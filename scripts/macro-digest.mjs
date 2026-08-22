@@ -3,8 +3,8 @@
 // Weekly Macro Indicators Digest — macro-digest.mjs
 // One Telegram card per indicator (FRED + FX + computed Buffett), each
 // followed by a single-indicator QuickChart line photo. Closes with an
-// AI capex table sourced from SEC EDGAR XBRL + manual estimates for
-// pre-IPO entities (OpenAI / Anthropic).
+// AI capex table sourced from SEC EDGAR XBRL, with manual estimates shown
+// separately for entities that have no filed XBRL yet (OpenAI / Anthropic).
 // ============================================================================
 
 import { readFile, writeFile } from 'fs/promises';
@@ -31,6 +31,7 @@ if (!CHAT_ID && !CHANNEL_CHAT_ID) {
 const __dirname   = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = resolve(__dirname, '../config/macro-indicators.json');
 const OUTPUT_FILE = '/tmp/macro-briefing.md';
+const DIGEST_TZ   = process.env.DIGEST_TIMEZONE || 'Australia/Sydney';
 
 // -- Transforms -------------------------------------------------------------
 
@@ -98,7 +99,7 @@ async function pLimit(items, limit, fn) {
 
 // -- Card renderer ----------------------------------------------------------
 
-function renderCard({ shortName, zhName, description, summary, nextRelease, unit, precision, dataLabel = '數據日期' }) {
+function renderCard({ shortName, zhName, description, summary, nextRelease, unit, precision, dataLabel = '數據日期', deltaLabel = '變動　' }) {
   const latestStr = fmt(summary.latest, unit, precision);
   const deltaStr  = fmtDeltaText(summary.latest, summary.previous, unit, precision);
 
@@ -107,7 +108,7 @@ function renderCard({ shortName, zhName, description, summary, nextRelease, unit
     escapeHtml(description),
     '',
     `• 最新值　　<b>${escapeHtml(latestStr)}</b>`,
-    `• 變動　　　${escapeHtml(deltaStr)}`,
+    `• ${deltaLabel}　　${escapeHtml(deltaStr)}`,
     `• ${dataLabel}　${escapeHtml(summary.latestDate || '—')}`,
     `• 下次發布　${escapeHtml(nextRelease || '—')}`,
   ].join('\n');
@@ -227,12 +228,18 @@ async function computeBuffett(cfg) {
     ]);
     if (!num.length || !den.length) return null;
 
+    // FRED publishes the two legs in different units: NCBEILQ027S is Millions
+    // of Dollars, GDP is Billions of Dollars. Without numeratorScale the ratio
+    // comes out 1000x too large (≈2400x instead of ≈2.4x).
+    const numScale = Number.isFinite(cfg.numeratorScale) ? cfg.numeratorScale : 1;
+    const denScale = Number.isFinite(cfg.denominatorScale) ? cfg.denominatorScale : 1;
+
     // Both quarterly — align by date prefix (YYYY-MM).
-    const denByMonth = new Map(den.map(d => [d.date.slice(0, 7), d.value]));
+    const denByMonth = new Map(den.map(d => [d.date.slice(0, 7), d.value * denScale]));
     const series = num.map(n => {
       const v = denByMonth.get(n.date.slice(0, 7));
       if (!Number.isFinite(v) || v === 0) return null;
-      return { date: n.date, value: n.value / v };
+      return { date: n.date, value: (n.value * numScale) / v };
     }).filter(Boolean);
 
     return { series, summary: summarizeSeries(series) };
@@ -244,7 +251,7 @@ async function computeBuffett(cfg) {
 
 // -- Capex table renderer --------------------------------------------------
 
-function renderCapexTable(rows) {
+function renderCapexTable(rows, headers, cols) {
   // Sort by capex value desc; failed rows sink to the bottom.
   const sorted = [...rows].sort((a, b) => {
     const av = Number.isFinite(a.sortValue) ? a.sortValue : -Infinity;
@@ -252,11 +259,8 @@ function renderCapexTable(rows) {
     return bv - av;
   });
 
-  // Five short columns. Total width ~38-40 cols — wider than v1 (was 30)
-  // to use more of the Telegram bubble's horizontal real estate, narrower
-  // than the surrounding HTML text so we don't force the bubble to grow.
-  const headers = ['公司', 'Capex', 'QoQ', 'YoY', '期間'];
-  const cols = ['name', 'value', 'qoq', 'yoy', 'period'];
+  // Short columns. Total width ~38-40 cols — wide enough to use the Telegram
+  // bubble's horizontal real estate, narrow enough not to force it to grow.
   const widths = headers.map((h, i) => Math.max(
     visualWidth(h),
     ...sorted.map(r => visualWidth(String(r[cols[i]] || '—'))),
@@ -266,16 +270,19 @@ function renderCapexTable(rows) {
   const lines = [
     headers.map((h, i) => padTo(h, widths[i])).join(' '),
     sep,
-    ...sorted.map(r => [
-      padTo(r.name   || '—', widths[0]),
-      padTo(r.value  || '—', widths[1], 'right'),
-      padTo(r.qoq    || '—', widths[2], 'right'),
-      padTo(r.yoy    || '—', widths[3], 'right'),
-      padTo(r.period || '—', widths[4]),
-    ].join(' ')),
+    ...sorted.map(r => cols.map((c, i) => padTo(
+      String(r[c] || '—'),
+      widths[i],
+      i === 0 || i === cols.length - 1 ? 'left' : 'right',
+    )).join(' ')),
   ];
   return lines.join('\n');
 }
+
+const ACTUAL_HEADERS = ['公司', 'Capex', 'QoQ', 'YoY', '期間'];
+const ACTUAL_COLS    = ['name', 'value', 'qoq', 'yoy', 'period'];
+const EST_HEADERS    = ['公司', '規模', '期間'];
+const EST_COLS       = ['name', 'value', 'period'];
 
 // "2026-03-31" → "26Q1"; "2025-12-31" → "25Q4". Used for chart x-axis ticks
 // so MSFT (fiscal Q3 ending Mar) and AMZN (calendar Q1 ending Mar) share the
@@ -288,6 +295,21 @@ function endDateToCalQ(end) {
   if (m <= 6)  return `${yr}Q2`;
   if (m <= 9)  return `${yr}Q3`;
   return `${yr}Q4`;
+}
+
+// Off-cycle fiscal calendars (Oracle ends May/Aug/Nov/Feb, Nvidia ends Jan)
+// produce period-end dates that fall inside a calendar quarter rather than on
+// its boundary. The chart's x-axis is keyed on the raw date, so those filers
+// would each get their own tick — two adjacent columns both labelled "26Q1".
+// Snap chart points to the calendar quarter-end they belong to; the table
+// keeps every company's true reported period.
+function snapToCalQuarterEnd(end) {
+  if (!end || end.length < 10) return end;
+  const yr = Number(end.slice(0, 4));
+  const m  = Number(end.slice(5, 7));
+  const qEndMonth = Math.ceil(m / 3) * 3;
+  const lastDay = new Date(Date.UTC(yr, qEndMonth, 0)).getUTCDate();
+  return `${yr}-${String(qEndMonth).padStart(2, '0')}-${lastDay}`;
 }
 
 function fmtDeltaPct(curr, base) {
@@ -323,15 +345,34 @@ async function main() {
     return { cfg, series, summary, nextRelease };
   });
 
-  console.log(`Fetching ${config.fx.length} Yahoo FX/index series...`);
+  console.log(`Fetching ${config.fx.length} Yahoo FX/index series (5y monthly for charts, 3mo daily for levels)...`);
   const fxResults = await Promise.allSettled(
     config.fx.map(cfg => fetchHistory(cfg.symbol, { range: '5y', interval: '1mo' })),
+  );
+  const fxDailyResults = await Promise.allSettled(
+    config.fx.map(cfg => fetchHistory(cfg.symbol, { range: '3mo', interval: '1d' })),
   );
   const fxEntries = config.fx.map((cfg, i) => {
     const r = fxResults[i];
     const series = r.status === 'fulfilled' ? r.value : [];
     if (series.length === 0) console.warn(`  FX ${cfg.symbol}: ${r.reason?.message || 'empty'}`);
-    return { cfg, series, summary: summarizeSeries(series) };
+
+    // The last bar of a 5y/1mo series is the CURRENT, still-open month and is
+    // dated the 1st of that month — quoting today's price under a "2026-08-01"
+    // reference date. Take the level and the reference date off the daily
+    // series instead, and compare against the close ~5 sessions back so the
+    // delta is week-over-week, matching the cadence of this digest.
+    const dr = fxDailyResults[i];
+    const daily = dr.status === 'fulfilled' ? dr.value : [];
+    const summary = daily.length > 0
+      ? {
+          latest: daily[daily.length - 1].value,
+          previous: daily[Math.max(0, daily.length - 6)]?.value,
+          latestDate: daily[daily.length - 1].date,
+        }
+      : summarizeSeries(series);
+    if (daily.length === 0) console.warn(`  FX ${cfg.symbol} daily: ${dr.reason?.message || 'empty'} — falling back to monthly bars`);
+    return { cfg, series, summary, weekly: daily.length > 0 };
   });
 
   console.log('Computing Buffett indicator (NCBEILQ027S / GDP)...');
@@ -339,7 +380,11 @@ async function main() {
   const buffett = await computeBuffett(buffettCfg);
 
   // -- Header ------------------------------------------------------------
+  // The workflow fires 21:00 UTC Friday so the digest lands Saturday morning
+  // in Sydney. Dating it off the runner's UTC clock stamps it Friday; render
+  // the header in the reader's timezone instead.
   const today = new Date().toLocaleDateString('zh-TW', {
+    timeZone: DIGEST_TZ,
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
   });
   await sendMessage(`📊 <b>每週總經速報</b>\n${today}`, 'HTML');
@@ -372,7 +417,7 @@ async function main() {
 
   // -- FX / index cards --------------------------------------------------
   for (const entry of fxEntries) {
-    const { cfg, series, summary } = entry;
+    const { cfg, series, summary, weekly } = entry;
     const card = renderCard({
       shortName: cfg.shortName,
       zhName: cfg.zhName,
@@ -381,7 +426,8 @@ async function main() {
       nextRelease: '即時 (交易時段內持續更新)',
       unit: cfg.unit,
       precision: cfg.precision,
-      dataLabel: '參考日期',
+      dataLabel: '收盤日期',
+      deltaLabel: weekly ? '週變動' : '月變動',
     });
     await sendCardWithChart({
       card,
@@ -416,79 +462,108 @@ async function main() {
   }
 
   // -- AI Capex table + 6-quarter trend chart ----------------------------
-  console.log('Fetching AI capex from SEC EDGAR + manual estimates...');
-  const publicEntries = config.capex.filter(c => !c.isPrivate && c.cik);
+  // Every company with a CIK goes to EDGAR; the manual estimate is only a
+  // fallback for when EDGAR has nothing usable yet. That way a newly listed
+  // filer (SpaceX in 2026-06) switches to real XBRL the quarter its first
+  // 10-Q lands, and Anthropic will too once its CIK is filled in — no code
+  // change, no `isPrivate` flag to remember to flip.
+  console.log('Fetching AI capex from SEC EDGAR (estimates only where EDGAR has no XBRL)...');
+  const filerEntries = config.capex.filter(c => c.cik);
   const capexResults = await pLimit(
-    publicEntries, 3,
+    filerEntries, 3,
     c => fetchLatestQuarterlyCapex(c.cik, { historyCount: 6 }),
   );
-
-  const capexRows = [];
-  const capexHistorySeries = [];
-
-  for (let i = 0; i < publicEntries.length; i++) {
-    const cfg = publicEntries[i];
+  const filedByCompany = new Map();
+  for (let i = 0; i < filerEntries.length; i++) {
     const r = capexResults[i];
-    if (r.status !== 'fulfilled' || !r.value) {
-      capexRows.push({ name: cfg.company, value: '—', qoq: '—', yoy: '—', period: '抓取失敗', sortValue: NaN });
+    if (r.status === 'fulfilled' && r.value) filedByCompany.set(filerEntries[i].company, r.value);
+    else if (r.status === 'rejected') console.warn(`  capex ${filerEntries[i].company}: ${r.reason?.message}`);
+  }
+
+  const actualRows = [];
+  const estimateRows = [];
+  const capexHistorySeries = [];
+  let anyDerivedQ4 = false;
+
+  for (const cfg of config.capex) {
+    const v = filedByCompany.get(cfg.company);
+    if (v) {
+      if (v.derived) anyDerivedQ4 = true;
+      actualRows.push({
+        name:      cfg.company,
+        value:     formatCapexB(v.value),
+        // An annual-only filer (fresh S-1, no 10-Q yet) has no prior quarter;
+        // its "previous" is the prior year, which the YoY column already says.
+        qoq:       v.periodKind === 'FY' ? '—' : fmtDeltaPct(v.value, v.previousValue),
+        yoy:       fmtDeltaPct(v.value, v.yoyValue),
+        period:    v.periodKind === 'FY'
+          ? shortPeriodLabel(v.end, 'FY')
+          : endDateToCalQ(v.end) + (v.derived ? '*' : ''),
+        sortValue: v.value,
+      });
+
+      // Chart series: date as YYYY-MM-DD for chronological sort, displayLabel
+      // as calendar-quarter label so mixed-fiscal-year companies align on the
+      // same x-axis ticks (MSFT FY-Q3 ending Mar and AMZN CY-Q1 ending Mar
+      // share the "26Q1" tick).
+      if (Array.isArray(v.history) && v.history.length >= 2) {
+        if (v.history.some(h => h.derived)) anyDerivedQ4 = true;
+        capexHistorySeries.push({
+          label: cfg.company,
+          points: v.history.map(h => ({
+            date: snapToCalQuarterEnd(h.end),
+            displayLabel: endDateToCalQ(h.end),
+            value: h.value / 1e9,
+          })),
+        });
+      }
       continue;
     }
-    const v = r.value;
-    capexRows.push({
-      name:      cfg.company,
-      value:     formatCapexB(v.value),
-      qoq:       fmtDeltaPct(v.value, v.previousValue),
-      yoy:       fmtDeltaPct(v.value, v.yoyValue),
-      period:    shortPeriodLabel(v.end, v.fp),
-      sortValue: v.value,
-    });
 
-    // Chart series: date as YYYY-MM-DD for chronological sort, displayLabel
-    // as calendar-quarter label so mixed-fiscal-year companies align on the
-    // same x-axis ticks (MSFT FY-Q3 ending Mar and AMZN CY-Q1 ending Mar
-    // share the "26Q1" tick).
-    if (Array.isArray(v.history) && v.history.length >= 2) {
-      capexHistorySeries.push({
-        label: cfg.company,
-        points: v.history.map(h => ({
-          date: h.end,
-          displayLabel: endDateToCalQ(h.end),
-          value: h.value / 1e9,
-        })),
-      });
-    }
-  }
-  for (const c of config.capex.filter(c => c.isPrivate)) {
-    const est = c.estimatedCapex;
+    // No filed XBRL — fall back to the configured estimate, kept in its own
+    // block. These are annual or multi-year figures and mostly cloud/lease
+    // commitments rather than balance-sheet capex, so ranking them alongside
+    // a single quarter of Meta PP&E would be an apples-to-oranges sort.
+    const est = cfg.estimatedCapex;
     if (est && Number.isFinite(est.valueUSD)) {
-      capexRows.push({
-        name:      `${c.company} 🔒`,
+      estimateRows.push({
+        name:      `${cfg.company} 🔒`,
         value:     formatCapexB(est.valueUSD),
-        qoq:       '估算',
-        yoy:       '—',
         period:    est.period,
         sortValue: est.valueUSD,
       });
+    } else if (cfg.cik) {
+      actualRows.push({ name: cfg.company, value: '—', qoq: '—', yoy: '—', period: '抓取失敗', sortValue: NaN });
     } else {
-      capexRows.push({ name: `${c.company} 🔒`, value: '—', qoq: '—', yoy: '—', period: '待估算', sortValue: NaN });
+      estimateRows.push({ name: `${cfg.company} 🔒`, value: '—', period: '待估算', sortValue: NaN });
     }
   }
 
-  const capexTable = renderCapexTable(capexRows);
-  const privateNotes = config.capex
-    .filter(c => c.isPrivate && c.estimatedCapex)
+  const capexTable = renderCapexTable(actualRows, ACTUAL_HEADERS, ACTUAL_COLS);
+  const estTable   = estimateRows.length
+    ? renderCapexTable(estimateRows, EST_HEADERS, EST_COLS)
+    : '';
+  const estNotes = config.capex
+    .filter(c => !filedByCompany.has(c.company) && c.estimatedCapex)
     .map(c => `• ${c.company}：${c.estimatedCapex.source}`)
     .join('\n');
+
   const capexMsg =
-    `💰 <b>AI Capex 追蹤</b>\n資料：SEC EDGAR XBRL (上市) + 新聞估算 (未上市，🔒)\n\n` +
+    `💰 <b>AI Capex 追蹤</b>\n單季實際值，資料：SEC EDGAR XBRL 現金流量表 (PP&E 採購)\n\n` +
     `<pre>${escapeHtml(capexTable)}</pre>` +
-    (privateNotes ? `\n\n<i>未上市估算來源</i>\n${escapeHtml(privateNotes)}` : '');
+    `\n<i>期間一律換算為日曆季 (Microsoft 6 月、Oracle 5 月結算會計年度已對齊)</i>` +
+    (anyDerivedQ4 ? `\n<i>* 該季未單獨申報，由 10-K 全年減前三季推導</i>` : '') +
+    (estTable
+      ? `\n\n<b>未上市／尚無 XBRL (🔒 估算，非單季，口徑與上表不同)</b>\n` +
+        `<pre>${escapeHtml(estTable)}</pre>`
+      : '') +
+    (estNotes ? `\n\n<i>估算來源</i>\n${escapeHtml(estNotes)}` : '');
 
   // Build trend chart (one combined line per company, last 6 periods, $B).
   let capexChartUrl = null;
   if (capexHistorySeries.length > 0) {
     const longUrl = buildMultiSparklineUrl(capexHistorySeries, {
-      title: 'AI Capex 趨勢 — 近 6 期 ($B)',
+      title: 'AI Capex 趨勢 — 近 6 個財季 ($B，僅已申報者)',
       yUnit: 'B',
       width: 700,
       height: 340,
@@ -510,8 +585,9 @@ async function main() {
     ...fxEntries.map(e => `${e.cfg.shortName}: ${fmt(e.summary.latest, e.cfg.unit, e.cfg.precision)} @ ${e.summary.latestDate || '—'}`),
     buffett ? `Buffett: ${fmt(buffett.summary.latest, 'x', 2)} @ ${buffett.summary.latestDate}` : 'Buffett: failed',
     '',
-    'AI Capex:',
+    'AI Capex (filed, quarterly):',
     capexTable,
+    ...(estTable ? ['', 'AI Capex (estimates):', estTable] : []),
   ].join('\n');
   await writeFile(OUTPUT_FILE, briefing, 'utf-8');
   console.log(`Briefing written to ${OUTPUT_FILE} (${briefing.length} chars)`);
