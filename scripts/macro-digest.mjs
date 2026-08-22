@@ -35,6 +35,15 @@ const DIGEST_TZ   = process.env.DIGEST_TIMEZONE || 'Australia/Sydney';
 
 // -- Transforms -------------------------------------------------------------
 
+function trimToYears(series, years) {
+  if (!Array.isArray(series) || series.length === 0) return series;
+  const cutoff = new Date();
+  cutoff.setFullYear(cutoff.getFullYear() - years);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  const trimmed = series.filter(o => o.date >= cutoffStr);
+  return trimmed.length >= 2 ? trimmed : series;
+}
+
 function applyTransform(obs, transform) {
   if (transform === 'yoy') return toYoYSeries(obs);
   if (transform === 'mom_diff_k') {
@@ -80,6 +89,22 @@ function inferFrequency(series) {
   if (median >= 20)  return 'monthly';
   if (median >= 5)   return 'weekly';
   return 'daily';
+}
+
+// DFF and DGS10 are daily, so summarizeSeries' "previous" is yesterday — in a
+// weekly digest that reads as "持平" on the Fed funds rate essentially every
+// week. Re-base the comparison on the observation closest to a week earlier.
+function withWeeklyDelta(series, summary) {
+  if (!Array.isArray(series) || series.length < 2 || !summary.latestDate) return summary;
+  const target = Date.parse(summary.latestDate) - 7 * 86_400_000;
+  let best = null, bestDiff = Infinity;
+  for (const o of series) {
+    if (o.date >= summary.latestDate) continue;
+    const diff = Math.abs(Date.parse(o.date) - target);
+    if (diff < bestDiff) { best = o; bestDiff = diff; }
+  }
+  if (!best || bestDiff > 4 * 86_400_000) return summary;
+  return { ...summary, previous: best.value, previousDate: best.date };
 }
 
 function formatObsDate(dateStr, freq) {
@@ -352,9 +377,12 @@ async function main() {
   const config = JSON.parse(await readFile(CONFIG_PATH, 'utf-8'));
 
   console.log(`Fetching ${config.fred.length} FRED series + release dates (concurrency 2, ~1.4 req/sec)…`);
+  // A YoY transform consumes the first 12 months, so a 5-year fetch yields a
+  // 4-year YoY series under a chart captioned "近 5 年". Fetch a year of
+  // run-up for those and trim back to five years after transforming.
   const fredObsResults = await pLimit(
     config.fred, 2,
-    cfg => fetchSeries(cfg.seriesId, { years: 5, apiKey: FRED_API_KEY }),
+    cfg => fetchSeries(cfg.seriesId, { years: cfg.transform === 'yoy' ? 6 : 5, apiKey: FRED_API_KEY }),
   );
   const fredReleaseResults = await pLimit(
     config.fred, 2,
@@ -367,10 +395,13 @@ async function main() {
       console.warn(`  FRED ${cfg.seriesId}: ${obsR.reason?.message || 'empty'}`);
       return { cfg, error: true };
     }
-    const series = applyTransform(obsR.value, cfg.transform);
-    const summary = summarizeSeries(series);
+    const series = trimToYears(applyTransform(obsR.value, cfg.transform), 5);
+    const freq = inferFrequency(series);
+    const summary = freq === 'daily'
+      ? withWeeklyDelta(series, summarizeSeries(series))
+      : summarizeSeries(series);
     const nextRelease = relR.status === 'fulfilled' ? relR.value : null;
-    return { cfg, series, summary, nextRelease, freq: inferFrequency(series) };
+    return { cfg, series, summary, nextRelease, freq };
   });
 
   console.log(`Fetching ${config.fx.length} Yahoo FX/index series (5y monthly for charts, 3mo daily for levels)...`);
@@ -434,6 +465,7 @@ async function main() {
       summary, nextRelease,
       unit: cfg.unit, precision: cfg.precision,
       dataDate: formatObsDate(summary.latestDate, freq),
+      deltaLabel: freq === 'daily' ? '週變動' : '變動　',
     });
     await sendCardWithChart({
       card,

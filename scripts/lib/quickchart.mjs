@@ -1,10 +1,19 @@
 // QuickChart.io URL builder for sparkline-as-photo. We use the GET endpoint
-// with a URL-encoded Chart.js v3 config. URLs stay well under Telegram's
+// with a URL-encoded Chart.js v4 config (see CHARTJS_VERSION below). URLs stay well under Telegram's
 // sendPhoto limit for our 5y monthly series (~60 points).
 
 const BASE = 'https://quickchart.io/chart';
 const CREATE = 'https://quickchart.io/chart/create';
 const TIMEOUT = 10_000;
+
+// QuickChart renders with Chart.js v2 unless told otherwise, and v2 does not
+// understand any of the v3+ option layout we use: `plugins.legend`,
+// `plugins.title` and `scales.{x,y}` are all unrecognised keys, so they were
+// being dropped on the floor. The visible result was a chart with the legend
+// still showing (v2 reads `options.legend`), no title at all, and ~30 rotated
+// x-axis labels because `maxTicksLimit` never applied. Pin the version so the
+// config we send is the config that renders.
+const CHARTJS_VERSION = '4';
 
 // POST chart config to QuickChart to get a short permanent URL. Long GET URLs
 // (4+ KB) occasionally fail in Telegram sendPhoto; the short URL is ~100 chars
@@ -19,6 +28,9 @@ export async function shortenChartUrl(longUrl) {
     const config = JSON.parse(u.searchParams.get('c'));
     const width  = u.searchParams.get('w');
     const height = u.searchParams.get('h');
+    // Carry the pinned Chart.js version across to the POST, or the shortened
+    // URL silently falls back to the v2 default that ignores our options.
+    const version = u.searchParams.get('v') || u.searchParams.get('version') || CHARTJS_VERSION;
 
     const res = await fetch(CREATE, {
       method: 'POST',
@@ -28,6 +40,7 @@ export async function shortenChartUrl(longUrl) {
         width: width ? Number(width) : undefined,
         height: height ? Number(height) : undefined,
         backgroundColor: 'white',
+        version,
       }),
       signal: AbortSignal.timeout(TIMEOUT),
     });
@@ -54,6 +67,12 @@ export function buildSparklineUrl(series, opts = {}) {
   const labels = series.map(p => (p.date || '').slice(0, 7));
   const data   = series.map(p => p.value);
 
+  // The unit goes in the title rather than a `ticks.callback`. QuickChart can
+  // eval function strings, but only for configs sent as JS object notation —
+  // ours is strict JSON, so the callback was never going to fire, and a title
+  // suffix says the same thing without depending on that.
+  const titleText = yUnit ? `${label} (${yUnit})` : label;
+
   const config = {
     type: 'line',
     data: {
@@ -72,17 +91,16 @@ export function buildSparklineUrl(series, opts = {}) {
     options: {
       plugins: {
         legend: { display: false },
-        title:  { display: !!label, text: label, font: { size: 14 } },
+        title:  { display: !!titleText, text: titleText, font: { size: 14 } },
       },
       scales: {
-        x: { ticks: { maxTicksLimit: 6, autoSkip: true } },
-        y: { ticks: { callback: `v => v + '${yUnit}'` } },
+        x: { ticks: { maxTicksLimit: 8, autoSkip: true, maxRotation: 0 } },
       },
     },
   };
 
   const encoded = encodeURIComponent(JSON.stringify(config));
-  return `${BASE}?w=${width}&h=${height}&bkg=white&c=${encoded}`;
+  return `${BASE}?v=${CHARTJS_VERSION}&w=${width}&h=${height}&bkg=white&c=${encoded}`;
 }
 
 // Combined chart of multiple series sharing the same x-axis. Useful for
@@ -134,21 +152,22 @@ export function buildMultiSparklineUrl(seriesList, opts = {}) {
     };
   });
 
+  const titleText = yUnit && title && !title.includes(yUnit) ? `${title} (${yUnit})` : title;
+
   const config = {
     type: 'line',
     data: { labels, datasets },
     options: {
       plugins: {
         legend: { display: true, position: 'top' },
-        title:  { display: !!title, text: title, font: { size: 14 } },
+        title:  { display: !!titleText, text: titleText, font: { size: 14 } },
       },
       scales: {
-        x: { ticks: { maxTicksLimit: 6, autoSkip: true } },
-        y: { ticks: { callback: `v => v + '${yUnit}'` } },
+        x: { ticks: { maxTicksLimit: 8, autoSkip: true, maxRotation: 0 } },
       },
     },
   };
 
   const encoded = encodeURIComponent(JSON.stringify(config));
-  return `${BASE}?w=${width}&h=${height}&bkg=white&c=${encoded}`;
+  return `${BASE}?v=${CHARTJS_VERSION}&w=${width}&h=${height}&bkg=white&c=${encoded}`;
 }
