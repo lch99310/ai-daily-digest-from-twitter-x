@@ -39,15 +39,23 @@ const CAPEX_CONCEPTS = [
   'PaymentsForPropertyPlantAndEquipment',
 ];
 
-// Last-resort name match, used only when none of CAPEX_CONCEPTS returns data:
+// Last-resort matcher, used only when none of CAPEX_CONCEPTS returns data:
 // swept across every taxonomy in companyfacts so company extension elements
-// are reachable too. Anchored on a payment/purchase verb so it cannot pick up
-// balances, non-cash additions, or disposal proceeds.
-const CAPEX_FALLBACK_RE = new RegExp([
-  'Payments(To|For)?[A-Za-z]*(PropertyPlantAndEquipment|PropertyAndEquipment|ProductiveAssets|CapitalImprovements|MachineryAndEquipment)',
-  'Purchases?Of[A-Za-z]*(PropertyPlantAndEquipment|PropertyAndEquipment|ProductiveAssets)',
-  'CapitalExpenditures?(PaidInCash|IncurredButNotYetPaid)?$',
-].join('|'), 'i');
+// are reachable too. Requiring the verb and the noun as separate tests rather
+// than one glued pattern matters — a filer that names its element
+// "PaymentsForPropertyEquipmentAndSatellites" has neither the exact string
+// "PropertyAndEquipment" nor "PropertyPlantAndEquipment" in it, and a rigid
+// pattern silently misses it.
+const CAPEX_VERB_RE = /(Payments?|Purchases?|Expenditures?)/i;
+const CAPEX_NOUN_RE = /(PropertyPlantAndEquipment|PropertyAndEquipment|PropertyEquipment|ProductiveAssets|CapitalExpenditure|CapitalImprovement|MachineryAndEquipment|ConstructionInProgress|Satellite)/i;
+// Balances, disposals and non-cash disclosures use the same nouns.
+const CAPEX_EXCLUDE_RE = /(Proceeds|Sales?Of|Disposal|Disposed|Noncash|NonCash|Accrued|Depreciation|Amortization|Impairment|Useful|Gross|Net(Book)?Value|Lease)/i;
+
+function looksLikeCapexConcept(name) {
+  return CAPEX_VERB_RE.test(name)
+      && CAPEX_NOUN_RE.test(name)
+      && !CAPEX_EXCLUDE_RE.test(name);
+}
 
 // Forms that legitimately disclose periodic capex via XBRL.
 // 10-Q / 10-K = ongoing US filers. S-1 = IPO prospectus (used by companies
@@ -223,14 +231,38 @@ export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) 
   if (byKey.size === 0) {
     try {
       const data = await getJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`);
+      const candidates = [];
+      const rejectedPeriods = [];
       for (const [taxonomy, concepts] of Object.entries(data.facts || {})) {
         for (const [name, def] of Object.entries(concepts)) {
-          if (!CAPEX_FALLBACK_RE.test(name)) continue;
-          for (const u of def.units?.USD || []) absorb(u, `${taxonomy}:${name}`, CAPEX_CONCEPTS.length);
+          if (!looksLikeCapexConcept(name)) continue;
+          const usd = def.units?.USD || [];
+          candidates.push(`${taxonomy}:${name}(${usd.length})`);
+          const before = byKey.size;
+          for (const u of usd) absorb(u, `${taxonomy}:${name}`, CAPEX_CONCEPTS.length);
+          if (byKey.size === before && usd.length) {
+            const sample = usd[usd.length - 1];
+            rejectedPeriods.push(`${name} ${sample.form} ${sample.start}→${sample.end}`);
+          }
         }
       }
+
       if (byKey.size > 0) {
         console.log(`  CIK ${padded}: matched via companyfacts sweep — ${[...conceptsSeen].join(', ')}`);
+      } else {
+        // Nothing usable. Dump enough of the company's own taxonomy to say
+        // WHY on the next run: either no capex-shaped element exists (list the
+        // near misses) or one does but its periods were rejected.
+        const near = [];
+        for (const [taxonomy, concepts] of Object.entries(data.facts || {})) {
+          for (const name of Object.keys(concepts)) {
+            if (/Propert|Capital|Purchase|Payment|Equipment|Satellite/i.test(name)) near.push(`${taxonomy}:${name}`);
+          }
+        }
+        console.warn(`  CIK ${padded}: companyfacts has no usable capex fact.`);
+        if (candidates.length)      console.warn(`    matched names : ${candidates.slice(0, 12).join(', ')}`);
+        if (rejectedPeriods.length) console.warn(`    periods dropped: ${rejectedPeriods.slice(0, 6).join(' | ')}`);
+        console.warn(`    near misses   : ${near.slice(0, 25).join(', ') || '(none)'}${near.length > 25 ? ` …+${near.length - 25}` : ''}`);
       }
     } catch (err) {
       console.warn(`  CIK ${padded} companyfacts sweep: ${err.message}`);
@@ -282,8 +314,28 @@ export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) 
   annual.sort((a, b) => b.end.localeCompare(a.end));
   for (const u of annual) u.periodKind = 'FY';
 
-  const pool = quarterly.length > 0 ? quarterly : annual;
-  if (pool.length === 0) return null;
+  // A first-time filer can have neither: its only 10-Q carries a single YTD
+  // column, and there is no earlier quarter on file to difference it against.
+  // Rather than report nothing, surface the cumulative figure and let the
+  // caller label it for what it is.
+  let pool = quarterly.length > 0 ? quarterly : annual;
+  if (pool.length === 0) {
+    pool = all
+      .filter(u => u.months === 6 || u.months === 9)
+      .sort((a, b) => b.end.localeCompare(a.end) || b.months - a.months)
+      .map(u => ({ ...u, periodKind: 'YTD' }));
+  }
+  if (pool.length === 0) {
+    // byKey had facts but none reduced to a reportable period — say what was
+    // there, or this comes back as a bare "抓取失敗" with no way to diagnose.
+    const sample = all
+      .sort((a, b) => b.end.localeCompare(a.end))
+      .slice(0, 6)
+      .map(u => `${u.concept} ${u.form} ${u.start}→${u.end} (${u.months}M)`);
+    console.warn(`  CIK ${padded}: ${all.length} fact(s) found but none reduce to a quarter, year or YTD period.`);
+    console.warn(`    ${sample.join(' | ')}`);
+    return null;
+  }
 
   const latest = pool[0];
 
@@ -310,6 +362,7 @@ export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) 
     filed: latest.filed,
     concept: latest.concept,
     periodKind: latest.periodKind,
+    months: latest.months,
     derived: !!latest.derived,
     previousValue: prev?.val,
     previousEnd: prev?.end,
@@ -332,6 +385,23 @@ export function formatCapexB(usd) {
 // Private-company estimates supply their own "Y26E" string via config.
 // `derived` marks a Q4 we computed as FY − (Q1+Q2+Q3) rather than read
 // straight off a filing.
+// Label for a cumulative period, derived from the end date and its length so
+// it is right regardless of what `start` the filer used: "26/1-6" for a first
+// half ending June 2026, "25/10-26/6" when the span crosses a year.
+export function periodSpanLabel(end, months) {
+  if (!end) return '—';
+  if (months === 12) return `Y${end.slice(2, 4)}`;
+  const endY = Number(end.slice(0, 4));
+  const endM = Number(end.slice(5, 7));
+  let startM = endM - months + 1;
+  let startY = endY;
+  while (startM <= 0) { startM += 12; startY -= 1; }
+  const yy = n => String(n).slice(2);
+  return startY === endY
+    ? `${yy(endY)}/${startM}-${endM}`
+    : `${yy(startY)}/${startM}-${yy(endY)}/${endM}`;
+}
+
 export function shortPeriodLabel(end, fp, derived = false) {
   if (!end) return fp || '—';
   const yr = end.slice(2, 4);
