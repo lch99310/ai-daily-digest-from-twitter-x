@@ -63,6 +63,34 @@ function fmtDeltaText(curr, prev, unit, precision) {
   return `${arrow} ${Math.abs(d).toFixed(precision)}${unit || ''} (上期 ${prev.toFixed(precision)}${unit || ''})`;
 }
 
+// FRED indexes an observation by the START of its period, so July CPI comes
+// back as "2026-07-01" — accurate but it reads like "data as of 1 July".
+// Render each series at its own granularity instead: a month for monthly
+// data, a quarter for quarterly, the actual date for daily.
+function inferFrequency(series) {
+  if (!Array.isArray(series) || series.length < 3) return 'daily';
+  const tail = series.slice(-7);
+  const gaps = [];
+  for (let i = 1; i < tail.length; i++) {
+    gaps.push((Date.parse(tail[i].date) - Date.parse(tail[i - 1].date)) / 86_400_000);
+  }
+  gaps.sort((a, b) => a - b);
+  const median = gaps[Math.floor(gaps.length / 2)];
+  if (median >= 75)  return 'quarterly';
+  if (median >= 20)  return 'monthly';
+  if (median >= 5)   return 'weekly';
+  return 'daily';
+}
+
+function formatObsDate(dateStr, freq) {
+  if (!dateStr || dateStr.length < 10) return dateStr || '—';
+  const yr = dateStr.slice(0, 4);
+  const mo = Number(dateStr.slice(5, 7));
+  if (freq === 'monthly')   return `${yr} 年 ${mo} 月`;
+  if (freq === 'quarterly') return `${yr} 年 Q${Math.ceil(mo / 3)}`;
+  return dateStr;
+}
+
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -99,7 +127,7 @@ async function pLimit(items, limit, fn) {
 
 // -- Card renderer ----------------------------------------------------------
 
-function renderCard({ shortName, zhName, description, summary, nextRelease, unit, precision, dataLabel = '數據日期', deltaLabel = '變動　' }) {
+function renderCard({ shortName, zhName, description, summary, nextRelease, unit, precision, dataLabel = '數據日期', deltaLabel = '變動　', dataDate }) {
   const latestStr = fmt(summary.latest, unit, precision);
   const deltaStr  = fmtDeltaText(summary.latest, summary.previous, unit, precision);
 
@@ -109,7 +137,7 @@ function renderCard({ shortName, zhName, description, summary, nextRelease, unit
     '',
     `• 最新值　　<b>${escapeHtml(latestStr)}</b>`,
     `• ${deltaLabel}　　${escapeHtml(deltaStr)}`,
-    `• ${dataLabel}　${escapeHtml(summary.latestDate || '—')}`,
+    `• ${dataLabel}　${escapeHtml(dataDate || summary.latestDate || '—')}`,
     `• 下次發布　${escapeHtml(nextRelease || '—')}`,
   ].join('\n');
 }
@@ -342,7 +370,7 @@ async function main() {
     const series = applyTransform(obsR.value, cfg.transform);
     const summary = summarizeSeries(series);
     const nextRelease = relR.status === 'fulfilled' ? relR.value : null;
-    return { cfg, series, summary, nextRelease };
+    return { cfg, series, summary, nextRelease, freq: inferFrequency(series) };
   });
 
   console.log(`Fetching ${config.fx.length} Yahoo FX/index series (5y monthly for charts, 3mo daily for levels)...`);
@@ -391,7 +419,7 @@ async function main() {
 
   // -- FRED cards --------------------------------------------------------
   for (const entry of fredEntries) {
-    const { cfg, series, summary, nextRelease, error } = entry;
+    const { cfg, series, summary, nextRelease, error, freq } = entry;
     if (error) {
       await sendMessage(
         `🔹 <b>${escapeHtml(cfg.shortName)}</b> — ${escapeHtml(cfg.zhName)}\n${escapeHtml(cfg.description || '')}\n\n⚠️ FRED 抓取失敗`,
@@ -405,6 +433,7 @@ async function main() {
       description: cfg.description || '',
       summary, nextRelease,
       unit: cfg.unit, precision: cfg.precision,
+      dataDate: formatObsDate(summary.latestDate, freq),
     });
     await sendCardWithChart({
       card,
@@ -448,7 +477,8 @@ async function main() {
       nextRelease: '每季 Flow of Funds 與 GDP 更新時同步',
       unit: buffettCfg.unit,
       precision: buffettCfg.precision,
-      dataLabel: '計算日期',
+      dataLabel: '計算季別',
+      dataDate: formatObsDate(buffett.summary.latestDate, 'quarterly'),
     });
     await sendCardWithChart({
       card,
@@ -539,6 +569,7 @@ async function main() {
     }
   }
 
+  const allFilersFailed = filerEntries.length > 0 && filedByCompany.size === 0;
   const capexTable = renderCapexTable(actualRows, ACTUAL_HEADERS, ACTUAL_COLS);
   const estTable   = estimateRows.length
     ? renderCapexTable(estimateRows, EST_HEADERS, EST_COLS)
@@ -550,9 +581,13 @@ async function main() {
 
   const capexMsg =
     `💰 <b>AI Capex 追蹤</b>\n單季實際值，資料：SEC EDGAR XBRL 現金流量表 (PP&E 採購)\n\n` +
-    `<pre>${escapeHtml(capexTable)}</pre>` +
-    `\n<i>期間一律換算為日曆季 (Microsoft 6 月、Oracle 5 月結算會計年度已對齊)</i>` +
-    (anyDerivedQ4 ? `\n<i>* 該季未單獨申報，由 10-K 全年減前三季推導</i>` : '') +
+    (allFilersFailed
+      ? `⚠️ SEC EDGAR 本次全數抓取失敗 (${filerEntries.length} 家)，本週無上市公司數據。\n` +
+        `請查 Actions log 的 HTTP 狀態碼；403 通常代表 User-Agent 未帶聯絡 email，` +
+        `可設 SEC_EDGAR_USER_AGENT 環境變數。`
+      : `<pre>${escapeHtml(capexTable)}</pre>` +
+        `\n<i>期間一律換算為日曆季 (Microsoft 6 月、Oracle 5 月結算會計年度已對齊)</i>` +
+        (anyDerivedQ4 ? `\n<i>* 該季未單獨申報，由 10-K 全年減前三季推導</i>` : '')) +
     (estTable
       ? `\n\n<b>未上市／尚無 XBRL (🔒 估算，非單季，口徑與上表不同)</b>\n` +
         `<pre>${escapeHtml(estTable)}</pre>`
@@ -581,9 +616,9 @@ async function main() {
     '',
     ...fredEntries.map(e => e.error
       ? `${e.cfg.shortName}: FRED 抓取失敗`
-      : `${e.cfg.shortName}: ${fmt(e.summary.latest, e.cfg.unit, e.cfg.precision)} @ ${e.summary.latestDate} | next: ${e.nextRelease || '—'}`),
+      : `${e.cfg.shortName}: ${fmt(e.summary.latest, e.cfg.unit, e.cfg.precision)} @ ${formatObsDate(e.summary.latestDate, e.freq)} | next: ${e.nextRelease || '—'}`),
     ...fxEntries.map(e => `${e.cfg.shortName}: ${fmt(e.summary.latest, e.cfg.unit, e.cfg.precision)} @ ${e.summary.latestDate || '—'}`),
-    buffett ? `Buffett: ${fmt(buffett.summary.latest, 'x', 2)} @ ${buffett.summary.latestDate}` : 'Buffett: failed',
+    buffett ? `Buffett: ${fmt(buffett.summary.latest, 'x', 2)} @ ${formatObsDate(buffett.summary.latestDate, 'quarterly')}` : 'Buffett: failed',
     '',
     'AI Capex (filed, quarterly):',
     capexTable,

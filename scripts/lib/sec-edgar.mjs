@@ -1,11 +1,30 @@
 // SEC EDGAR companyconcept API — capex from XBRL filings.
-// Free, no API key. SEC requires a descriptive User-Agent that identifies the
-// requester; override with SEC_EDGAR_USER_AGENT if you want your own contact.
-// https://www.sec.gov/edgar/sec-api-documentation
+// Free, no API key, but SEC gates automated traffic on the User-Agent: it must
+// carry a CONTACT EMAIL ADDRESS in the form "Company Name contact@domain.com".
+// A UA without an email — a bare product string, or one carrying only a URL —
+// gets a blanket 403 "Your Request Originates from an Undeclared Automated
+// Tool" on every endpoint. Set SEC_EDGAR_USER_AGENT to your own real contact.
+// https://www.sec.gov/os/webmaster-faq#developers
 
 const UA = process.env.SEC_EDGAR_USER_AGENT
-  || 'My Daily Digest macro-digest (+https://github.com/lch99310/My_Daily_Digest)';
+  || 'My Daily Digest macro-digest contact@example.com';
 const TIMEOUT = 12_000;
+
+// SEC asks automated clients to stay under 10 requests/second. We issue
+// 6 concepts x N companies; a 120ms floor between request starts keeps us
+// comfortably inside that regardless of the caller's concurrency.
+let _lastCallAt = 0;
+const MIN_GAP_MS = 120;
+
+// Trip after a few 403s: a rejected User-Agent fails identically for every
+// request, so retrying the rest of the run only burns the job's time budget.
+let _forbiddenCount = 0;
+const FORBIDDEN_TRIP = 3;
+async function rateLimitWait() {
+  const wait = Math.max(0, _lastCallAt + MIN_GAP_MS - Date.now());
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  _lastCallAt = Date.now();
+}
 
 const CAPEX_CONCEPTS = [
   // us-gaap variants — companies pick whichever fits their disclosure style.
@@ -79,13 +98,46 @@ function findNearEnd(list, targetEnd, tolDays) {
   return best;
 }
 
-async function getJson(url) {
-  const res = await fetch(url, {
-    headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-    signal: AbortSignal.timeout(TIMEOUT),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+// SEC returns 403 both for a rejected User-Agent and for exceeding the rate
+// threshold, and the two are only distinguishable from the response body — so
+// carry a snippet of it into the error. Retry 403/429/5xx a couple of times:
+// a rate-limit 403 clears, a UA rejection will not, and the body then says
+// which one you are looking at.
+async function getJson(url, { attempts = 3 } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    await rateLimitWait();
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: {
+          'User-Agent': UA,
+          'Accept': 'application/json',
+          'Accept-Encoding': 'gzip, deflate',
+        },
+        signal: AbortSignal.timeout(TIMEOUT),
+      });
+    } catch (err) {
+      lastErr = err;
+      if (attempt === attempts) throw err;
+      await new Promise(r => setTimeout(r, 800 * attempt));
+      continue;
+    }
+
+    if (res.ok) return res.json();
+
+    const body = (await res.text().catch(() => '')).replace(/\s+/g, ' ').trim();
+    lastErr = new Error(`HTTP ${res.status}${body ? `: ${body.slice(0, 160)}` : ''}`);
+    if (res.status === 404) throw lastErr;                     // concept not reported
+    if (res.status === 403 && ++_forbiddenCount === FORBIDDEN_TRIP) {
+      console.warn(`  SEC EDGAR is refusing this client (403). Check the User-Agent carries a contact email — set SEC_EDGAR_USER_AGENT. Response: ${body.slice(0, 160)}`);
+    }
+    const rateLimited = res.status === 429 || res.status >= 500
+      || (res.status === 403 && _forbiddenCount < FORBIDDEN_TRIP);
+    if (!rateLimited || attempt === attempts) throw lastErr;
+    await new Promise(r => setTimeout(r, 1500 * attempt));
+  }
+  throw lastErr;
 }
 
 // Returns { value, end, fp, fy, form, previousValue, previousEnd, periodKind,
@@ -123,7 +175,8 @@ export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) 
       }
     } catch (err) {
       // 404 = company doesn't report under this concept; that's fine.
-      if (!String(err.message).includes('404')) {
+      // Match on the status prefix — the body snippet may itself contain "404".
+      if (!String(err.message).startsWith('HTTP 404')) {
         console.warn(`  CIK ${padded} ${concept}: ${err.message}`);
       }
     }
