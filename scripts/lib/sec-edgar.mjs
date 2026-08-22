@@ -39,6 +39,16 @@ const CAPEX_CONCEPTS = [
   'PaymentsForPropertyPlantAndEquipment',
 ];
 
+// Last-resort name match, used only when none of CAPEX_CONCEPTS returns data:
+// swept across every taxonomy in companyfacts so company extension elements
+// are reachable too. Anchored on a payment/purchase verb so it cannot pick up
+// balances, non-cash additions, or disposal proceeds.
+const CAPEX_FALLBACK_RE = new RegExp([
+  'Payments(To|For)?[A-Za-z]*(PropertyPlantAndEquipment|PropertyAndEquipment|ProductiveAssets|CapitalImprovements|MachineryAndEquipment)',
+  'Purchases?Of[A-Za-z]*(PropertyPlantAndEquipment|PropertyAndEquipment|ProductiveAssets)',
+  'CapitalExpenditures?(PaidInCash|IncurredButNotYetPaid)?$',
+].join('|'), 'i');
+
 // Forms that legitimately disclose periodic capex via XBRL.
 // 10-Q / 10-K = ongoing US filers. S-1 = IPO prospectus (used by companies
 // like SpaceX in the window between registration and their first 10-Q).
@@ -50,12 +60,23 @@ const ACCEPTED_FORMS = new Set([
   'F-1',  'F-1/A',
 ]);
 
-// A quarter is ~91 days, a fiscal year ~365. Anything in between (a 6-month
-// or 9-month year-to-date column, which every 10-Q tags alongside the
-// 3-month one under the SAME `end` and `fp`) is discarded — mixing those in
-// is what makes a "quarterly" capex figure silently balloon to a YTD total.
-const Q_MIN_DAYS = 80,  Q_MAX_DAYS = 100;
-const FY_MIN_DAYS = 330, FY_MAX_DAYS = 400;
+// Cash-flow items come in two shapes and you cannot tell them apart from
+// `fp` alone, because a 10-Q tags its 3-month and its year-to-date column
+// under the SAME `end` and `fp`:
+//
+//   Amazon, Microsoft  — 10-Q shows a three-month column AND a YTD column
+//   Alphabet, Meta,    — 10-Q cash-flow statement shows ONLY the YTD column
+//   Oracle               (Oracle's Q3 10-Q is headed "Nine Months Ended")
+//
+// So we keep every 3/6/9/12-month period, then reduce to discrete quarters:
+// a filed 3-month figure is used as-is, and where only YTD exists the quarter
+// is recovered by differencing consecutive steps of the same fiscal-year
+// chain (Q3 = 9-month − 6-month, Q4 = FY − 9-month). Differencing is exact,
+// not an estimate. Filtering to 3-month periods only — which is what a naive
+// YTD guard does — silently strands a YTD-only filer at its fiscal Q1, the
+// one quarter where YTD and the discrete quarter coincide.
+const MIN_DAYS = 80, MAX_DAYS = 400;
+const DAYS_PER_MONTH = 30.4375;
 
 function durationDays(start, end) {
   if (!start || !end) return null;
@@ -63,12 +84,21 @@ function durationDays(start, end) {
   return Number.isFinite(d) ? Math.round(d) : null;
 }
 
-function periodKindFor(start, end) {
+// Length of the period in months, snapped to the only values a cash-flow
+// column can legitimately have. Anything else (a stub period, a 52/53-week
+// oddity outside tolerance) returns null and is dropped.
+function periodMonths(start, end) {
   const days = durationDays(start, end);
-  if (days == null) return null;
-  if (days >= Q_MIN_DAYS  && days <= Q_MAX_DAYS)  return 'Q';
-  if (days >= FY_MIN_DAYS && days <= FY_MAX_DAYS) return 'FY';
-  return null;
+  if (days == null || days < MIN_DAYS || days > MAX_DAYS) return null;
+  const months = Math.round(days / DAYS_PER_MONTH);
+  return [3, 6, 9, 12].includes(months) ? months : null;
+}
+
+function periodKindFor(start, end) {
+  const months = periodMonths(start, end);
+  if (months === 3)  return 'Q';
+  if (months === 12) return 'FY';
+  return months ? 'YTD' : null;
 }
 
 // Calendar arithmetic on YYYY-MM-DD strings, clamped to month end so
@@ -152,27 +182,31 @@ async function getJson(url, { attempts = 3 } = {}) {
 export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) {
   const padded = String(cik).padStart(10, '0');
 
-  // (end + periodKind) → entry; later filings win, then earlier concepts.
+  // (start + end) → entry; later filings win, then earlier concepts. Keying
+  // on the full period (not just `end`) is what lets the 3-month and the YTD
+  // column of the same 10-Q coexist instead of overwriting each other.
   const byKey = new Map();
+  const conceptsSeen = new Set();
+
+  const absorb = (u, concept, rank) => {
+    if (!ACCEPTED_FORMS.has(u.form)) return;
+    const months = periodMonths(u.start, u.end);
+    if (!months) return;
+    const key = `${u.start}|${u.end}`;
+    const prev = byKey.get(key);
+    const wins = !prev
+      || u.filed > prev.filed
+      || (u.filed === prev.filed && rank < prev.conceptRank);
+    if (wins) byKey.set(key, { ...u, months, concept, conceptRank: rank });
+    conceptsSeen.add(concept);
+  };
 
   for (let rank = 0; rank < CAPEX_CONCEPTS.length; rank++) {
     const concept = CAPEX_CONCEPTS[rank];
     try {
       const url = `https://data.sec.gov/api/xbrl/companyconcept/CIK${padded}/us-gaap/${concept}.json`;
       const data = await getJson(url);
-      const usd = data.units?.USD || [];
-
-      for (const u of usd) {
-        if (!ACCEPTED_FORMS.has(u.form)) continue;
-        const kind = periodKindFor(u.start, u.end);
-        if (!kind) continue;  // drops 6-month / 9-month YTD duplicates
-        const key = `${u.end}|${kind}`;
-        const prev = byKey.get(key);
-        const wins = !prev
-          || u.filed > prev.filed
-          || (u.filed === prev.filed && rank < prev.conceptRank);
-        if (wins) byKey.set(key, { ...u, periodKind: kind, concept, conceptRank: rank });
-      }
+      for (const u of data.units?.USD || []) absorb(u, concept, rank);
     } catch (err) {
       // 404 = company doesn't report under this concept; that's fine.
       // Match on the status prefix — the body snippet may itself contain "404".
@@ -182,36 +216,71 @@ export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) 
     }
   }
 
-  if (byKey.size === 0) return null;
-
-  const all       = [...byKey.values()];
-  const quarterly = all.filter(u => u.periodKind === 'Q');
-  const annual    = all.filter(u => u.periodKind === 'FY');
-
-  // Derive the fourth fiscal quarter from the 10-K. Without this the
-  // quarterly series silently skips one quarter a year — which both breaks
-  // the trend chart and makes a June-fiscal-year filer (Microsoft) look a
-  // quarter staler than its calendar-year peers.
-  for (const fy of annual) {
-    if (findNearEnd(quarterly, fy.end, 20)) continue;  // Q4 already tagged
-    const q3 = findNearEnd(quarterly, addMonths(fy.end, -3), 20);
-    const q2 = findNearEnd(quarterly, addMonths(fy.end, -6), 20);
-    const q1 = findNearEnd(quarterly, addMonths(fy.end, -9), 20);
-    if (!q1 || !q2 || !q3) continue;
-    const val = fy.val - (q1.val + q2.val + q3.val);
-    if (!Number.isFinite(val) || val <= 0) continue;
-    quarterly.push({
-      ...fy,
-      val,
-      start: addMonths(fy.end, -3),
-      periodKind: 'Q',
-      fp: 'Q4',
-      derived: true,
-    });
+  // None of the well-known us-gaap concepts hit. A recent filer may tag capex
+  // under a company extension element (SpaceX is a live example), so sweep
+  // companyfacts for anything capex-shaped in any taxonomy. One extra request,
+  // and only on the path where we would otherwise return nothing at all.
+  if (byKey.size === 0) {
+    try {
+      const data = await getJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`);
+      for (const [taxonomy, concepts] of Object.entries(data.facts || {})) {
+        for (const [name, def] of Object.entries(concepts)) {
+          if (!CAPEX_FALLBACK_RE.test(name)) continue;
+          for (const u of def.units?.USD || []) absorb(u, `${taxonomy}:${name}`, CAPEX_CONCEPTS.length);
+        }
+      }
+      if (byKey.size > 0) {
+        console.log(`  CIK ${padded}: matched via companyfacts sweep — ${[...conceptsSeen].join(', ')}`);
+      }
+    } catch (err) {
+      console.warn(`  CIK ${padded} companyfacts sweep: ${err.message}`);
+    }
   }
 
+  if (byKey.size === 0) return null;
+
+  const all    = [...byKey.values()];
+  const annual = all.filter(u => u.months === 12);
+
+  // Reduce to discrete quarters. A filed 3-month figure wins outright; every
+  // other quarter is recovered by differencing its fiscal-year chain. Chain
+  // members all share the fiscal year's `start`, so grouping on it separates
+  // the YTD ladder from the standalone 3-month facts automatically.
+  const discreteByEnd = new Map();
+  for (const u of all) {
+    if (u.months !== 3) continue;
+    const prev = discreteByEnd.get(u.end);
+    if (!prev || u.filed > prev.filed) discreteByEnd.set(u.end, { ...u, derived: false });
+  }
+
+  const chains = new Map();
+  for (const u of all) {
+    if (!chains.has(u.start)) chains.set(u.start, []);
+    chains.get(u.start).push(u);
+  }
+  for (const chain of chains.values()) {
+    chain.sort((a, b) => a.months - b.months);
+    for (let i = 1; i < chain.length; i++) {
+      const cur = chain[i], prior = chain[i - 1];
+      if (cur.months - prior.months !== 3) continue;   // need a contiguous step
+      if (discreteByEnd.has(cur.end)) continue;        // a filed 3-month wins
+      const val = cur.val - prior.val;
+      if (!Number.isFinite(val) || val < 0) continue;
+      discreteByEnd.set(cur.end, {
+        ...cur,
+        val,
+        start: prior.end,
+        months: 3,
+        fp: cur.fp === 'FY' ? 'Q4' : cur.fp,
+        derived: true,
+      });
+    }
+  }
+
+  const quarterly = [...discreteByEnd.values()].map(u => ({ ...u, periodKind: 'Q' }));
   quarterly.sort((a, b) => b.end.localeCompare(a.end));
   annual.sort((a, b) => b.end.localeCompare(a.end));
+  for (const u of annual) u.periodKind = 'FY';
 
   const pool = quarterly.length > 0 ? quarterly : annual;
   if (pool.length === 0) return null;

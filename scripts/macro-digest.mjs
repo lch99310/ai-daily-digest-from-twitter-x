@@ -506,8 +506,17 @@ async function main() {
   const filedByCompany = new Map();
   for (let i = 0; i < filerEntries.length; i++) {
     const r = capexResults[i];
-    if (r.status === 'fulfilled' && r.value) filedByCompany.set(filerEntries[i].company, r.value);
-    else if (r.status === 'rejected') console.warn(`  capex ${filerEntries[i].company}: ${r.reason?.message}`);
+    const name = filerEntries[i].company;
+    if (r.status === 'fulfilled' && r.value) {
+      const v = r.value;
+      filedByCompany.set(name, v);
+      console.log(`  ${name}: ${formatCapexB(v.value)} @ ${v.end} (${v.periodKind}${v.derived ? ', 差分' : ''}) ` +
+                  `via ${v.concept}, ${v.history.length} 期`);
+    } else if (r.status === 'rejected') {
+      console.warn(`  capex ${name}: ${r.reason?.message}`);
+    } else {
+      console.warn(`  capex ${name}: no usable XBRL period found`);
+    }
   }
 
   const actualRows = [];
@@ -587,7 +596,7 @@ async function main() {
         `可設 SEC_EDGAR_USER_AGENT 環境變數。`
       : `<pre>${escapeHtml(capexTable)}</pre>` +
         `\n<i>期間一律換算為日曆季 (Microsoft 6 月、Oracle 5 月結算會計年度已對齊)</i>` +
-        (anyDerivedQ4 ? `\n<i>* 該季未單獨申報，由 10-K 全年減前三季推導</i>` : '')) +
+        (anyDerivedQ4 ? `\n<i>* 該季未單獨申報 (財報只揭露累計數)，由累計數差分還原；數值精確，非估算</i>` : '')) +
     (estTable
       ? `\n\n<b>未上市／尚無 XBRL (🔒 估算，非單季，口徑與上表不同)</b>\n` +
         `<pre>${escapeHtml(estTable)}</pre>`
