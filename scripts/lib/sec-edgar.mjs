@@ -39,15 +39,23 @@ const CAPEX_CONCEPTS = [
   'PaymentsForPropertyPlantAndEquipment',
 ];
 
-// Last-resort name match, used only when none of CAPEX_CONCEPTS returns data:
+// Last-resort matcher, used only when none of CAPEX_CONCEPTS returns data:
 // swept across every taxonomy in companyfacts so company extension elements
-// are reachable too. Anchored on a payment/purchase verb so it cannot pick up
-// balances, non-cash additions, or disposal proceeds.
-const CAPEX_FALLBACK_RE = new RegExp([
-  'Payments(To|For)?[A-Za-z]*(PropertyPlantAndEquipment|PropertyAndEquipment|ProductiveAssets|CapitalImprovements|MachineryAndEquipment)',
-  'Purchases?Of[A-Za-z]*(PropertyPlantAndEquipment|PropertyAndEquipment|ProductiveAssets)',
-  'CapitalExpenditures?(PaidInCash|IncurredButNotYetPaid)?$',
-].join('|'), 'i');
+// are reachable too. Requiring the verb and the noun as separate tests rather
+// than one glued pattern matters — a filer that names its element
+// "PaymentsForPropertyEquipmentAndSatellites" has neither the exact string
+// "PropertyAndEquipment" nor "PropertyPlantAndEquipment" in it, and a rigid
+// pattern silently misses it.
+const CAPEX_VERB_RE = /(Payments?|Purchases?|Expenditures?)/i;
+const CAPEX_NOUN_RE = /(PropertyPlantAndEquipment|PropertyAndEquipment|PropertyEquipment|ProductiveAssets|CapitalExpenditure|CapitalImprovement|MachineryAndEquipment|ConstructionInProgress|Satellite)/i;
+// Balances, disposals and non-cash disclosures use the same nouns.
+const CAPEX_EXCLUDE_RE = /(Proceeds|Sales?Of|Disposal|Disposed|Noncash|NonCash|Accrued|Depreciation|Amortization|Impairment|Useful|Gross|Net(Book)?Value|Lease)/i;
+
+function looksLikeCapexConcept(name) {
+  return CAPEX_VERB_RE.test(name)
+      && CAPEX_NOUN_RE.test(name)
+      && !CAPEX_EXCLUDE_RE.test(name);
+}
 
 // Forms that legitimately disclose periodic capex via XBRL.
 // 10-Q / 10-K = ongoing US filers. S-1 = IPO prospectus (used by companies
@@ -223,14 +231,38 @@ export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) 
   if (byKey.size === 0) {
     try {
       const data = await getJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`);
+      const candidates = [];
+      const rejectedPeriods = [];
       for (const [taxonomy, concepts] of Object.entries(data.facts || {})) {
         for (const [name, def] of Object.entries(concepts)) {
-          if (!CAPEX_FALLBACK_RE.test(name)) continue;
-          for (const u of def.units?.USD || []) absorb(u, `${taxonomy}:${name}`, CAPEX_CONCEPTS.length);
+          if (!looksLikeCapexConcept(name)) continue;
+          const usd = def.units?.USD || [];
+          candidates.push(`${taxonomy}:${name}(${usd.length})`);
+          const before = byKey.size;
+          for (const u of usd) absorb(u, `${taxonomy}:${name}`, CAPEX_CONCEPTS.length);
+          if (byKey.size === before && usd.length) {
+            const sample = usd[usd.length - 1];
+            rejectedPeriods.push(`${name} ${sample.form} ${sample.start}→${sample.end}`);
+          }
         }
       }
+
       if (byKey.size > 0) {
         console.log(`  CIK ${padded}: matched via companyfacts sweep — ${[...conceptsSeen].join(', ')}`);
+      } else {
+        // Nothing usable. Dump enough of the company's own taxonomy to say
+        // WHY on the next run: either no capex-shaped element exists (list the
+        // near misses) or one does but its periods were rejected.
+        const near = [];
+        for (const [taxonomy, concepts] of Object.entries(data.facts || {})) {
+          for (const name of Object.keys(concepts)) {
+            if (/Propert|Capital|Purchase|Payment|Equipment|Satellite/i.test(name)) near.push(`${taxonomy}:${name}`);
+          }
+        }
+        console.warn(`  CIK ${padded}: companyfacts has no usable capex fact.`);
+        if (candidates.length)      console.warn(`    matched names : ${candidates.slice(0, 12).join(', ')}`);
+        if (rejectedPeriods.length) console.warn(`    periods dropped: ${rejectedPeriods.slice(0, 6).join(' | ')}`);
+        console.warn(`    near misses   : ${near.slice(0, 25).join(', ') || '(none)'}${near.length > 25 ? ` …+${near.length - 25}` : ''}`);
       }
     } catch (err) {
       console.warn(`  CIK ${padded} companyfacts sweep: ${err.message}`);
