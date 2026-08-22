@@ -1,5 +1,5 @@
 {
-  "_doc": "Weekly macro digest config. One card + one chart per indicator. NAPM (ISM PMI) and WILL5000IND were retired from FRED due to licensing disputes — replaced with INDPRO (Industrial Production) and ^GSPC (S&P 500). Buffett Indicator uses FRED NCBEILQ027S (market value of nonfinancial corporate equities) / GDP; NCBEILQ027S is published in MILLIONS of dollars while GDP is in BILLIONS, so numeratorScale rebases it. Capex comes from SEC EDGAR XBRL for every company with a `cik`; `estimatedCapex` is only a fallback used when EDGAR has no usable XBRL yet, so a company switches from estimate to filed data automatically the quarter its first 10-Q lands — adding a CIK is the only edit needed.",
+  "_doc": "Weekly macro digest config. One card + one chart per indicator. NAPM (ISM PMI) and WILL5000IND were retired from FRED due to licensing disputes — replaced with INDPRO (Industrial Production) and ^GSPC (S&P 500). Buffett Indicator divides total corporate equity market value by GDP. numeratorSources is an ordered fallback list: the first entry whose every series resolves is used, so the nonfinancial-only series still covers us if the financial-sector leg fails. Z.1 equity series are published in MILLIONS of dollars while GDP is in BILLIONS, hence scale. Capex comes from SEC EDGAR XBRL for every company with a `cik`; `estimatedCapex` is only a fallback used when EDGAR has no usable XBRL yet, so a company switches from estimate to filed data automatically the quarter its first 10-Q lands — adding a CIK is the only edit needed.",
   "fred": [
     {
       "seriesId": "CPIAUCSL",
@@ -127,15 +127,30 @@
       "id": "buffett",
       "shortName": "Buffett Indicator",
       "zhName": "巴菲特指標",
-      "description": "FRED NCBEILQ027S (非金融企業股本市值) ÷ GDP；歷史均值約 0.8-1.0，>1.5 視為偏高估值。分子原始單位為百萬美元，已換算為十億美元與 GDP 對齊。",
-      "numeratorSeriesId": "NCBEILQ027S",
+      "description": "÷ GDP；歷史均值約 0.8-1.0，>1.5 視為偏高估值。",
       "denominatorSeriesId": "GDP",
       "unit": "x",
       "precision": 2,
       "chart": true,
       "color": "rgb(153,102,255)",
-      "numeratorScale": 0.001,
-      "numeratorUnits": "millions",
+      "numeratorSources": [
+        {
+          "label": "Fed Z.1 全市場股本市值 (非金融 + 金融)",
+          "seriesIds": [
+            "NCBEILQ027S",
+            "FBCELLQ027S"
+          ],
+          "scale": 0.001
+        },
+        {
+          "label": "Fed Z.1 非金融企業股本市值 (fallback，未含金融業)",
+          "seriesIds": [
+            "NCBEILQ027S"
+          ],
+          "scale": 0.001
+        }
+      ],
+      "_wilshireNote": "原始 Buffett 指標分子為 Wilshire 5000 Full Cap Price Index x $1.15B。FRED 於 2024-06-03 因授權移除全部 Wilshire 資料，該 legacy 換算法也隨免費 feed 停止於 2024，無法再自動取得美元市值 (Yahoo ^W5000 / ^FTW5000 只有指數點數)。Fed Z.1 全市場口徑為現行標準替代。",
       "denominatorUnits": "billions"
     }
   ],

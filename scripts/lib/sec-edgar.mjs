@@ -314,8 +314,28 @@ export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) 
   annual.sort((a, b) => b.end.localeCompare(a.end));
   for (const u of annual) u.periodKind = 'FY';
 
-  const pool = quarterly.length > 0 ? quarterly : annual;
-  if (pool.length === 0) return null;
+  // A first-time filer can have neither: its only 10-Q carries a single YTD
+  // column, and there is no earlier quarter on file to difference it against.
+  // Rather than report nothing, surface the cumulative figure and let the
+  // caller label it for what it is.
+  let pool = quarterly.length > 0 ? quarterly : annual;
+  if (pool.length === 0) {
+    pool = all
+      .filter(u => u.months === 6 || u.months === 9)
+      .sort((a, b) => b.end.localeCompare(a.end) || b.months - a.months)
+      .map(u => ({ ...u, periodKind: 'YTD' }));
+  }
+  if (pool.length === 0) {
+    // byKey had facts but none reduced to a reportable period — say what was
+    // there, or this comes back as a bare "抓取失敗" with no way to diagnose.
+    const sample = all
+      .sort((a, b) => b.end.localeCompare(a.end))
+      .slice(0, 6)
+      .map(u => `${u.concept} ${u.form} ${u.start}→${u.end} (${u.months}M)`);
+    console.warn(`  CIK ${padded}: ${all.length} fact(s) found but none reduce to a quarter, year or YTD period.`);
+    console.warn(`    ${sample.join(' | ')}`);
+    return null;
+  }
 
   const latest = pool[0];
 
@@ -342,6 +362,7 @@ export async function fetchLatestQuarterlyCapex(cik, { historyCount = 6 } = {}) 
     filed: latest.filed,
     concept: latest.concept,
     periodKind: latest.periodKind,
+    months: latest.months,
     derived: !!latest.derived,
     previousValue: prev?.val,
     previousEnd: prev?.end,
@@ -364,6 +385,23 @@ export function formatCapexB(usd) {
 // Private-company estimates supply their own "Y26E" string via config.
 // `derived` marks a Q4 we computed as FY − (Q1+Q2+Q3) rather than read
 // straight off a filing.
+// Label for a cumulative period, derived from the end date and its length so
+// it is right regardless of what `start` the filer used: "26/1-6" for a first
+// half ending June 2026, "25/10-26/6" when the span crosses a year.
+export function periodSpanLabel(end, months) {
+  if (!end) return '—';
+  if (months === 12) return `Y${end.slice(2, 4)}`;
+  const endY = Number(end.slice(0, 4));
+  const endM = Number(end.slice(5, 7));
+  let startM = endM - months + 1;
+  let startY = endY;
+  while (startM <= 0) { startM += 12; startY -= 1; }
+  const yy = n => String(n).slice(2);
+  return startY === endY
+    ? `${yy(endY)}/${startM}-${endM}`
+    : `${yy(startY)}/${startM}-${yy(endY)}/${endM}`;
+}
+
 export function shortPeriodLabel(end, fp, derived = false) {
   if (!end) return fp || '—';
   const yr = end.slice(2, 4);

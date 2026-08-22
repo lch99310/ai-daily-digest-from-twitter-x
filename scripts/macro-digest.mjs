@@ -14,7 +14,7 @@ import { dirname, resolve } from 'path';
 import { fetchSeries, summarizeSeries, toYoYSeries, fetchNextReleaseDate } from './lib/fred.mjs';
 import { fetchHistory } from './lib/yahoo.mjs';
 import { buildSparklineUrl, buildMultiSparklineUrl, shortenChartUrl } from './lib/quickchart.mjs';
-import { fetchLatestQuarterlyCapex, formatCapexB, shortPeriodLabel } from './lib/sec-edgar.mjs';
+import { fetchLatestQuarterlyCapex, formatCapexB, shortPeriodLabel, periodSpanLabel } from './lib/sec-edgar.mjs';
 
 const FRED_API_KEY    = process.env.FRED_API_KEY || '';
 const BOT_TOKEN       = process.env.FINANCE_TELEGRAM_BOT_TOKEN || '';
@@ -274,32 +274,74 @@ async function sendCardWithChart({ card, series, color, yUnit, captionLabel }) {
 // -- Buffett indicator: market cap (NCBEILQ027S, $B) ÷ GDP ($B) -----------
 
 async function computeBuffett(cfg) {
+  const denScale = Number.isFinite(cfg.denominatorScale) ? cfg.denominatorScale : 1;
+
+  let den;
   try {
-    const [num, den] = await Promise.all([
-      fetchSeries(cfg.numeratorSeriesId, { years: 5, apiKey: FRED_API_KEY }),
-      fetchSeries(cfg.denominatorSeriesId, { years: 5, apiKey: FRED_API_KEY }),
-    ]);
-    if (!num.length || !den.length) return null;
-
-    // FRED publishes the two legs in different units: NCBEILQ027S is Millions
-    // of Dollars, GDP is Billions of Dollars. Without numeratorScale the ratio
-    // comes out 1000x too large (≈2400x instead of ≈2.4x).
-    const numScale = Number.isFinite(cfg.numeratorScale) ? cfg.numeratorScale : 1;
-    const denScale = Number.isFinite(cfg.denominatorScale) ? cfg.denominatorScale : 1;
-
-    // Both quarterly — align by date prefix (YYYY-MM).
-    const denByMonth = new Map(den.map(d => [d.date.slice(0, 7), d.value * denScale]));
-    const series = num.map(n => {
-      const v = denByMonth.get(n.date.slice(0, 7));
-      if (!Number.isFinite(v) || v === 0) return null;
-      return { date: n.date, value: (n.value * numScale) / v };
-    }).filter(Boolean);
-
-    return { series, summary: summarizeSeries(series) };
+    den = await fetchSeries(cfg.denominatorSeriesId, { years: 5, apiKey: FRED_API_KEY });
   } catch (err) {
-    console.warn(`  Buffett compute failed: ${err.message}`);
+    console.warn(`  Buffett denominator ${cfg.denominatorSeriesId} failed: ${err.message}`);
     return null;
   }
+  if (!den.length) return null;
+  const denByMonth = new Map(den.map(d => [d.date.slice(0, 7), d.value * denScale]));
+
+  // numeratorSources is an ordered fallback list. The original Buffett
+  // numerator — Wilshire 5000 Full Cap Price Index x $1.15B — is no longer
+  // obtainable: FRED dropped all Wilshire data in June 2024 over licensing
+  // and the legacy conversion died with the free feed, so the Fed Z.1 total
+  // (nonfinancial + financial corporate equities) is the standing substitute,
+  // with the nonfinancial leg alone as the fallback if the other is missing.
+  const sources = Array.isArray(cfg.numeratorSources) && cfg.numeratorSources.length
+    ? cfg.numeratorSources
+    : [{ label: cfg.numeratorSeriesId, seriesIds: [cfg.numeratorSeriesId], scale: cfg.numeratorScale ?? 1 }];
+
+  for (const src of sources) {
+    try {
+      const legs = await Promise.all(
+        src.seriesIds.map(id => fetchSeries(id, { years: 5, apiKey: FRED_API_KEY })),
+      );
+      const empty = src.seriesIds.filter((id, i) => !legs[i].length);
+      if (empty.length) {
+        console.warn(`  Buffett source "${src.label}": ${empty.join(', ')} returned no rows — trying next`);
+        continue;
+      }
+
+      // All legs are quarterly Z.1 series; align on YYYY-MM and require every
+      // leg to have the quarter, so a partially-updated release can never
+      // produce a total that silently omits a sector.
+      const scale = Number.isFinite(src.scale) ? src.scale : 1;
+      const byMonth = new Map();
+      for (const obs of legs[0]) byMonth.set(obs.date.slice(0, 7), { date: obs.date, total: obs.value });
+      for (const leg of legs.slice(1)) {
+        const seen = new Map(leg.map(o => [o.date.slice(0, 7), o.value]));
+        for (const [month, entry] of byMonth) {
+          const v = seen.get(month);
+          if (Number.isFinite(v)) entry.total += v;
+          else byMonth.delete(month);
+        }
+      }
+
+      const series = [...byMonth.values()]
+        .sort((a, b) => a.date.localeCompare(b.date))
+        .map(e => {
+          const gdp = denByMonth.get(e.date.slice(0, 7));
+          if (!Number.isFinite(gdp) || gdp === 0) return null;
+          return { date: e.date, value: (e.total * scale) / gdp };
+        })
+        .filter(Boolean);
+
+      if (series.length < 2) {
+        console.warn(`  Buffett source "${src.label}": only ${series.length} aligned quarter(s) — trying next`);
+        continue;
+      }
+      console.log(`  Buffett numerator: ${src.label} (${src.seriesIds.join(' + ')})`);
+      return { series, summary: summarizeSeries(series), source: src };
+    } catch (err) {
+      console.warn(`  Buffett source "${src.label}" failed: ${err.message} — trying next`);
+    }
+  }
+  return null;
 }
 
 // -- Capex table renderer --------------------------------------------------
@@ -504,7 +546,9 @@ async function main() {
     const card = renderCard({
       shortName: buffettCfg.shortName,
       zhName: buffettCfg.zhName,
-      description: buffettCfg.description,
+      description: buffett.source?.label
+        ? `${buffett.source.label} ${buffettCfg.description}`
+        : buffettCfg.description,
       summary: buffett.summary,
       nextRelease: '每季 Flow of Funds 與 GDP 更新時同步',
       unit: buffettCfg.unit,
@@ -553,11 +597,22 @@ async function main() {
 
   const actualRows = [];
   const estimateRows = [];
+  const ytdNotes = [];
   const capexHistorySeries = [];
   let anyDerivedQ4 = false;
 
   for (const cfg of config.capex) {
     const v = filedByCompany.get(cfg.company);
+    if (v && v.periodKind === 'YTD') {
+      estimateRows.push({
+        name:      `${cfg.company} 📄`,
+        value:     formatCapexB(v.value),
+        period:    periodSpanLabel(v.end, v.months),
+        sortValue: v.value,
+      });
+      ytdNotes.push(`${cfg.company}：EDGAR 目前僅有累計數，尚無可還原的單季 (首次申報者常見)`);
+      continue;
+    }
     if (v) {
       if (v.derived) anyDerivedQ4 = true;
       actualRows.push({
@@ -630,9 +685,10 @@ async function main() {
         `\n<i>期間一律換算為日曆季 (Microsoft 6 月、Oracle 5 月結算會計年度已對齊)</i>` +
         (anyDerivedQ4 ? `\n<i>* 該季未單獨申報 (財報只揭露累計數)，由累計數差分還原；數值精確，非估算</i>` : '')) +
     (estTable
-      ? `\n\n<b>未上市／尚無 XBRL (🔒 估算，非單季，口徑與上表不同)</b>\n` +
+      ? `\n\n<b>其他口徑 (非單季，不與上表比較)</b>\n📄 已申報累計數　🔒 新聞估算\n` +
         `<pre>${escapeHtml(estTable)}</pre>`
       : '') +
+    (ytdNotes.length ? `\n<i>${escapeHtml(ytdNotes.join('\n'))}</i>` : '') +
     (estNotes ? `\n\n<i>估算來源</i>\n${escapeHtml(estNotes)}` : '');
 
   // Build trend chart (one combined line per company, last 6 periods, $B).
